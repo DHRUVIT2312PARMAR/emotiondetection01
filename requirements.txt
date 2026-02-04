@@ -1,11 +1,12 @@
-opencv-python-headless
-numpy
-tensorflow
-tf-keras
 fastapi
 uvicorn
-scipy
+opencv-python-headless
 mediapipe
+numpy
+deepface
+tf-keras
+tensorflow
+scipy
 python-multipart
 gunicorn
 matplotlib
