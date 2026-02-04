@@ -398,12 +398,23 @@ def stop_system():
 
 @app.post("/control")
 async def control(request: Request):
-    data = await request.json()
-    cmd = data.get("command")
+    try:
+        data = await request.json()
+    except:
+        data = {}
+    
+    # Check for 'action' or 'command'
+    action = data.get("action") or data.get("command") or "start"
+    
     with state.lock:
-        if cmd == "start": state.is_running = True
-        elif cmd == "stop": state.is_running = False
-    return {"status": "ok", "is_running": state.is_running}
+        if action == "start": state.is_running = True
+        elif action == "stop": state.is_running = False
+    
+    return {
+        "message": f"Action {action} received",
+        "status": "ok",
+        "is_running": state.is_running
+    }
 
 @app.get("/status")
 def get_status():
