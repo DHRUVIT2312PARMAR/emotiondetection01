@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
+from pydantic import BaseModel
 
 # ============================================================================
 # MediaPipe Tasks API Initialization (Robust Landmarks)
@@ -380,9 +381,8 @@ async def reset_camera():
     # Simple hack: The worker is robust. We can add a 'reset_requested' flag to DetectionState.
     state.reset_requested = True
     return {"status": "Camera reset requested"}
-
-
-
+class ControlRequest(BaseModel):
+    action: str
 
 @app.get("/start")
 def start_system():
@@ -397,15 +397,8 @@ def stop_system():
     return {"status": "stopped", "is_running": False}
 
 @app.post("/control")
-async def control(request: Request):
-    try:
-        data = await request.json()
-    except:
-        data = {}
-    
-    # Check for 'action' or 'command'
-    action = data.get("action") or data.get("command") or "start"
-    
+def control(data: ControlRequest):
+    action = data.action
     with state.lock:
         if action == "start": state.is_running = True
         elif action == "stop": state.is_running = False
