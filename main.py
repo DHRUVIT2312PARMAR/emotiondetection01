@@ -381,6 +381,7 @@ async def reset_camera():
     # Simple hack: The worker is robust. We can add a 'reset_requested' flag to DetectionState.
     state.reset_requested = True
     return {"status": "Camera reset requested"}
+# Swagger fix: Ensuring input box appears by using Pydantic BaseModel
 class ControlRequest(BaseModel):
     action: str
 
