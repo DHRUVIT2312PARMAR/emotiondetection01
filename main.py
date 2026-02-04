@@ -1,423 +1,428 @@
-"""
-Enhanced Emotion Detection System
-Features:
-1. Real-time emotion detection (original)
-2. Emotion statistics dashboard
-3. Age and gender detection
-4. Emotion-based messages
-5. Visitor counter
-6. Emotion heatmap (border colors)
-7. Voice feedback (TTS)
-"""
-
 import cv2
 import numpy as np
-from tensorflow.keras.models import load_model
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-import pyttsx3
+from tf_keras.models import load_model
 import threading
-from collections import defaultdict, deque
+from collections import defaultdict
 from scipy.spatial import distance
 import time
+import base64
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import os
 
 # ============================================================================
-# SECTION 1: INITIALIZATION & CONFIGURATION
+# MediaPipe Tasks API Initialization (Robust Landmarks)
+# ============================================================================
+MEDIAPIPE_ENABLED = False
+landmarker = None
+
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    
+    base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_face_transformation_matrixes=False,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    landmarker = vision.FaceLandmarker.create_from_options(options)
+    MEDIAPIPE_ENABLED = True
+    print("[OK] MediaPipe FaceLandmarker Tasks API initialized.")
+except Exception as e:
+    print(f"[WARN] MediaPipe Tasks initialization failed: {e}. Falling back to Haar Cascades.")
+
+# ============================================================================
+# SECTION 1: INITIALIZATION & CONFIG
 # ============================================================================
 
-# Load emotion detection model
-emotion_model = load_model("model/emotion_model.h5", compile=False)
+# Load models
+try:
+    emotion_model = load_model("model/emotion_model.h5", compile=False)
+    print("[OK] Emotion model loaded successfully.")
+except Exception as e:
+    print(f"[ERR] Could not load emotion model: {e}")
+    emotion_model = None
+
 emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
 
-# Face detector
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
+# Fallback Face detector (Haar Cascades)
+cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+face_cascade = cv2.CascadeClassifier(cascade_path)
+if face_cascade.empty():
+    face_cascade = cv2.CascadeClassifier("haarcascade/haarcascade_frontalface_default.xml")
 
-# Age and Gender Detection Models (OpenCV DNN)
-# Download these models from OpenCV GitHub repository
+# Face Detector selection handled in Tasks API initialization block above
+
+# Age/Gender Models
 AGE_MODEL = 'models/age_net.caffemodel'
 AGE_PROTO = 'models/age_deploy.prototxt'
 GENDER_MODEL = 'models/gender_net.caffemodel'
 GENDER_PROTO = 'models/gender_deploy.prototxt'
-
-# Age and gender labels
 AGE_RANGES = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(25-32)', '(38-43)', '(48-53)', '(60-100)']
 GENDER_LIST = ['Male', 'Female']
 
-# Try to load age/gender models (optional - will work without them)
 try:
     age_net = cv2.dnn.readNetFromCaffe(AGE_PROTO, AGE_MODEL)
     gender_net = cv2.dnn.readNetFromCaffe(GENDER_PROTO, GENDER_MODEL)
     AGE_GENDER_ENABLED = True
-    print("✓ Age/Gender models loaded successfully")
 except:
     AGE_GENDER_ENABLED = False
-    print("⚠ Age/Gender models not found. Feature disabled.")
-    print("  Download from: https://github.com/opencv/opencv/tree/master/samples/dnn/face_detector")
 
 # ============================================================================
-# SECTION 2: EMOTION-BASED MESSAGES
+# SECTION 2: SYSTEM STATE
 # ============================================================================
+
+class DetectionState:
+    def __init__(self):
+        self.is_running = False
+        self.is_running = False
+        self.camera_url = "" # Deprecated, using USB
+        self.emotion = "Neutral"
+        self.age = "N/A"
+        self.gender = "N/A"
+        self.visitors = 0
+        self.message = "System Ready"
+        self.heatmap = "amber"
+        self.emotion_stats = {label: 0 for label in emotion_labels}
+        self.current_frame = None
+        self.system_status = {
+            "camera": "System Camera",
+            "ai_model": "Active" if emotion_model else "Error",
+            "backend": "Running"
+        }
+        
+        # Face Locking State
+        self.locked_face = None # { 'box': (x,y,w,h), 'start_time': 0 }
+        self.last_detection_time = 0
+        
+        self.frame_count = 0
+        self.frame_count = 0
+        self.lock = threading.Lock()
+        
+        # Analysis State
+        self.analysis_buffer = []
+        self.analysis_complete = False
+        self.final_result = {}
+
+state = DetectionState()
+# Add reset flag
+state.reset_requested = False
+
+EMOTION_HEATMAP = {
+    'Happy': 'green', 'Sad': 'blue', 'Angry': 'red', 
+    'Neutral': 'amber', 'Surprise': 'pink', 'Fear': 'purple', 'Disgust': 'teal'
+}
 
 EMOTION_MESSAGES = {
-    'Happy': "Keep smiling! 😄",
-    'Sad': "Everything will be okay 🌱",
-    'Angry': "Take a deep breath 💨",
-    'Surprise': "What a surprise! 😮",
-    'Fear': "Stay calm, you're safe 🛡️",
-    'Disgust': "Stay positive! ✨",
+    'Happy': "Keep smiling! 😄", 'Sad': "Everything will be okay 🌱",
+    'Angry': "Take a deep breath 💨", 'Surprise': "What a surprise! 😮",
+    'Fear': "Stay calm, you're safe 🛡️", 'Disgust': "Stay positive! ✨",
     'Neutral': "Have a great day! 👋"
 }
 
 # ============================================================================
-# SECTION 3: EMOTION HEATMAP (BORDER COLORS)
+# SECTION 3: CORE LOGIC & THREADS
 # ============================================================================
 
-EMOTION_COLORS = {
-    'Happy': (0, 255, 0),      # Green
-    'Sad': (255, 100, 0),      # Blue
-    'Angry': (0, 0, 255),      # Red
-    'Neutral': (0, 255, 255),  # Yellow
-    'Surprise': (255, 0, 255), # Magenta
-    'Fear': (128, 0, 128),     # Purple
-    'Disgust': (0, 128, 128)   # Teal
-}
-
-# ============================================================================
-# SECTION 4: STATISTICS & VISITOR TRACKING
-# ============================================================================
-
-# Emotion statistics counter
-emotion_stats = defaultdict(int)
-
-# Visitor tracking
-visitor_count = 0
-tracked_faces = []  # Store face positions for tracking
-FACE_DISTANCE_THRESHOLD = 100  # Pixels - adjust based on your setup
-visitor_spoken = set()  # Track which visitors have been greeted
-
-# ============================================================================
-# SECTION 5: TEXT-TO-SPEECH SETUP
-# ============================================================================
-
-# Initialize TTS engine (runs in separate thread to avoid blocking)
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 150)  # Speed
-tts_engine.setProperty('volume', 0.9)  # Volume
-
-def speak_async(text):
-    """Speak text in a separate thread to avoid blocking main loop"""
-    def _speak():
-        try:
-            tts_engine.say(text)
-            tts_engine.runAndWait()
-        except:
-            pass  # Ignore TTS errors
-    
-    thread = threading.Thread(target=_speak, daemon=True)
-    thread.start()
-
-# ============================================================================
-# SECTION 6: VISITOR TRACKING FUNCTIONS
-# ============================================================================
-
-def is_new_visitor(face_center, tracked_faces):
-    """
-    Check if detected face is a new visitor
-    Uses center point distance to determine uniqueness
-    """
-    if not tracked_faces:
-        return True
-    
-    for tracked_center in tracked_faces:
-        dist = distance.euclidean(face_center, tracked_center)
-        if dist < FACE_DISTANCE_THRESHOLD:
-            return False  # Similar face already tracked
-    
-    return True
-
-def get_face_center(x, y, w, h):
-    """Calculate center point of face bounding box"""
-    return (x + w // 2, y + h // 2)
-
-# ============================================================================
-# SECTION 7: AGE & GENDER DETECTION
-# ============================================================================
-
-def detect_age_gender(frame, face_roi):
-    """
-    Detect age and gender using OpenCV DNN models
-    Returns: (age_range, gender)
-    """
-    if not AGE_GENDER_ENABLED:
-        return "N/A", "N/A"
-    
+def detect_age_gender(face_roi):
+    if not AGE_GENDER_ENABLED or face_roi.size == 0: return "N/A", "N/A"
     try:
-        # Prepare blob for DNN
-        blob = cv2.dnn.blobFromImage(face_roi, 1.0, (227, 227),
-                                     (78.4263377603, 87.7689143744, 114.895847746),
-                                     swapRB=False)
-        
-        # Predict gender
+        blob = cv2.dnn.blobFromImage(face_roi, 1.0, (227, 227), (78.4, 87.7, 114.8), swapRB=False)
         gender_net.setInput(blob)
-        gender_preds = gender_net.forward()
-        gender = GENDER_LIST[gender_preds[0].argmax()]
-        
-        # Predict age
+        gender = GENDER_LIST[gender_net.forward()[0].argmax()]
         age_net.setInput(blob)
-        age_preds = age_net.forward()
-        age = AGE_RANGES[age_preds[0].argmax()]
-        
+        age = AGE_RANGES[age_net.forward()[0].argmax()]
         return age, gender
-    except:
-        return "N/A", "N/A"
+    except: return "N/A", "N/A"
 
 # ============================================================================
-# SECTION 8: STATISTICS VISUALIZATION
+# MediaPipe Import & Initialization
 # ============================================================================
+MEDIAPIPE_ENABLED = False
+face_mesh = None
+mp_face_mesh = None
+mp_drawing = None
+mp_drawing_styles = None
 
-def create_stats_chart(emotion_stats):
-    """
-    Create a bar chart of emotion statistics
-    Returns: OpenCV-compatible image
-    """
-    if not emotion_stats or sum(emotion_stats.values()) == 0:
-        # Return blank chart if no data
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.text(0.5, 0.5, 'No data yet...', ha='center', va='center', fontsize=16)
-        ax.axis('off')
-    else:
-        # Create bar chart
-        fig, ax = plt.subplots(figsize=(6, 4), facecolor='#1a1a1a')
-        ax.set_facecolor('#2a2a2a')
-        
-        emotions = list(emotion_stats.keys())
-        counts = list(emotion_stats.values())
-        
-        colors = [EMOTION_COLORS.get(e, (200, 200, 200)) for e in emotions]
-        colors_normalized = [(b/255, g/255, r/255) for r, g, b in colors]
-        
-        bars = ax.bar(emotions, counts, color=colors_normalized, edgecolor='white', linewidth=1.5)
-        
-        ax.set_xlabel('Emotions', fontsize=12, color='white', fontweight='bold')
-        ax.set_ylabel('Count', fontsize=12, color='white', fontweight='bold')
-        ax.set_title('Emotion Statistics Dashboard', fontsize=14, color='white', fontweight='bold', pad=20)
-        ax.tick_params(colors='white', labelsize=10)
-        ax.spines['bottom'].set_color('white')
-        ax.spines['left'].set_color('white')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        
-        # Add value labels on bars
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{int(height)}',
-                   ha='center', va='bottom', color='white', fontweight='bold')
-    
-    # Convert matplotlib figure to OpenCV image
-    canvas = FigureCanvasAgg(fig)
-    canvas.draw()
-    buf = canvas.buffer_rgba()
-    chart_img = np.asarray(buf)
-    chart_img = cv2.cvtColor(chart_img, cv2.COLOR_RGBA2BGR)
-    
-    plt.close(fig)
-    return chart_img
+try:
+    import mediapipe as mp
+    from mediapipe.solutions import face_mesh as mp_face_mesh
+    from mediapipe.solutions import drawing_utils as mp_drawing
+    from mediapipe.solutions import drawing_styles as mp_drawing_styles
+    MEDIAPIPE_ENABLED = True
+    print("[OK] MediaPipe modules imported successfully.")
+except Exception as e:
+    print(f"[WARN] Standard MediaPipe import failed: {e}. Trying alternate import...")
+    try:
+        import mediapipe.python.solutions.face_mesh as mp_face_mesh
+        import mediapipe.python.solutions.drawing_utils as mp_drawing
+        import mediapipe.python.solutions.drawing_styles as mp_drawing_styles
+        MEDIAPIPE_ENABLED = True
+        print("[OK] Alternate MediaPipe modules imported successfully.")
+    except Exception as e2:
+        print(f"[ERR] All MediaPipe import attempts failed. Falling back to Haar Cascades.")
 
-# ============================================================================
-# SECTION 9: MAIN DETECTION LOOP
-# ============================================================================
+# Fallback Face detector (Haar Cascades)
+cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+face_cascade = cv2.CascadeClassifier(cascade_path)
+if face_cascade.empty():
+    face_cascade = cv2.CascadeClassifier("haarcascade/haarcascade_frontalface_default.xml")
 
-def main():
-    global visitor_count, emotion_stats, tracked_faces
-    
-    cap = cv2.VideoCapture(0)
-    
-    # Set camera resolution for better performance
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
-    # Performance optimization variables
-    frame_count = 0
-    chart_update_interval = 30  # Update chart every 30 frames (~1 second at 30fps)
-    stats_chart = None
-    
-    # Dominant emotion tracking for border color
-    dominant_emotion = 'Neutral'
-    
-    print("\n" + "="*60)
-    print("🎭 ENHANCED EMOTION DETECTION SYSTEM")
-    print("="*60)
-    print("Features Active:")
-    print("  ✓ Real-time Emotion Detection")
-    print("  ✓ Emotion Statistics Dashboard")
-    print(f"  {'✓' if AGE_GENDER_ENABLED else '✗'} Age & Gender Detection")
-    print("  ✓ Emotion-Based Messages")
-    print("  ✓ Visitor Counter")
-    print("  ✓ Emotion Heatmap (Border Colors)")
-    print("  ✓ Voice Feedback (TTS)")
-    print("\nPress ESC to exit")
-    print("="*60 + "\n")
+if MEDIAPIPE_ENABLED:
+    try:
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        print("[OK] MediaPipe Face Mesh initialized.")
+    except Exception as e:
+        print(f"[ERR] Face Mesh initialization failed: {e}. MediaPipe disabled.")
+        MEDIAPIPE_ENABLED = False
+
+def camera_worker():
+    """Background thread to read from IP Camera and process frames"""
+    cap = None
+    active_index = -1
+    last_reconnect_attempt = 0
     
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if state.reset_requested:
+            if cap: cap.release()
+            cap = None; active_index = -1; state.reset_requested = False
+            with state.lock: state.system_status["camera"] = "Resetting..."
+            time.sleep(1); continue
+
+        with state.lock: running = state.is_running
         
-        frame_count += 1
-        
-        # Convert to grayscale for face detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Detect faces
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-        
-        # Track current frame emotions for dominant emotion
-        current_emotions = []
-        
-        # Process each detected face
-        for (x, y, w, h) in faces:
-            # ----------------------------------------------------------------
-            # EMOTION DETECTION (Original Logic)
-            # ----------------------------------------------------------------
-            face_gray = gray[y:y+h, x:x+w]
-            face_resized = cv2.resize(face_gray, (48, 48))
-            face_normalized = face_resized / 255.0
-            face_input = np.reshape(face_normalized, (1, 48, 48, 1))
-            
-            prediction = emotion_model.predict(face_input, verbose=0)
-            emotion = emotion_labels[np.argmax(prediction)]
-            
-            current_emotions.append(emotion)
-            emotion_stats[emotion] += 1
-            
-            # ----------------------------------------------------------------
-            # AGE & GENDER DETECTION
-            # ----------------------------------------------------------------
-            age, gender = "N/A", "N/A"
-            if AGE_GENDER_ENABLED and frame_count % 5 == 0:  # Every 5 frames for performance
-                face_roi = frame[y:y+h, x:x+w]
-                age, gender = detect_age_gender(frame, face_roi)
-            
-            # ----------------------------------------------------------------
-            # VISITOR TRACKING
-            # ----------------------------------------------------------------
-            face_center = get_face_center(x, y, w, h)
-            
-            if is_new_visitor(face_center, tracked_faces):
-                visitor_count += 1
-                tracked_faces.append(face_center)
-                
-                # Voice greeting for new visitor (only once)
-                visitor_id = f"{face_center[0]}_{face_center[1]}"
-                if visitor_id not in visitor_spoken:
-                    greeting = f"Welcome! You look {emotion.lower()}. {EMOTION_MESSAGES[emotion]}"
-                    speak_async(greeting)
-                    visitor_spoken.add(visitor_id)
-                
-                # Keep only recent 20 tracked faces to avoid memory issues
-                if len(tracked_faces) > 20:
-                    tracked_faces.pop(0)
-                    visitor_spoken.clear()  # Reset spoken tracking
-            
-            # ----------------------------------------------------------------
-            # DRAW BOUNDING BOX & LABELS
-            # ----------------------------------------------------------------
-            # Use emotion-specific color for bounding box
-            box_color = EMOTION_COLORS.get(emotion, (0, 255, 0))
-            cv2.rectangle(frame, (x, y), (x+w, y+h), box_color, 3)
-            
-            # Prepare label text
-            if AGE_GENDER_ENABLED and age != "N/A":
-                label = f"{emotion} | {gender} {age}"
+        if cap is None:
+            if time.time() - last_reconnect_attempt > 2:
+                last_reconnect_attempt = time.time()
+                index = 0
+                try:
+                    # Remove CAP_DSHOW for Linux compatibility (Render)
+                    temp_cap = cv2.VideoCapture(index) 
+                    if temp_cap.isOpened():
+                        ret_check, _ = temp_cap.read()
+                        if ret_check:
+                            cap = temp_cap; active_index = index
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            with state.lock: state.system_status["camera"] = "Default Camera Ready"
+                        else: temp_cap.release()
+                except: pass
+                if cap is None:
+                    with state.lock: state.system_status["camera"] = "Error: No Camera Found"
             else:
-                label = emotion
+                time.sleep(1)
+                blank_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blank_frame, "SEARCHING CAMERA...", (160, 180), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                _, buffer = cv2.imencode('.jpg', blank_frame)
+                with state.lock:
+                    state.current_frame = buffer.tobytes()
+                    state.system_status["camera"] = "Searching..."
+                continue
+
+        if cap:
+            ret, frame = cap.read()
+            if not ret:
+                cap.release(); cap = None
+                with state.lock: state.system_status["camera"] = "Connection Lost"
+                continue
+
+            frame = cv2.flip(frame, 1)
+            frame = cv2.resize(frame, (640, 360))
+            h, w = frame.shape[:2]
             
-            # Draw label background
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(frame, (x, y - 35), (x + label_size[0] + 10, y), box_color, -1)
+            roi_h, roi_w = int(h * 0.6), int(w * 0.4)
+            roi_x1, roi_y1 = (w - roi_w) // 2, (h - roi_h) // 2
+            roi_x2, roi_y2 = roi_x1 + roi_w, roi_y1 + roi_h
             
-            # Draw label text
-            cv2.putText(frame, label, (x + 5, y - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 255, 255), 1)
+            cv2.putText(frame, "DETECTION ZONE", (roi_x1, roi_y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            if running:
+                if state.frame_count % 2 == 0:
+                    roi_faces = []
+                    if MEDIAPIPE_ENABLED:
+                        # Use Tasks API
+                        mp_image = mp.Image.create_from_numpy(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        res = landmarker.detect(mp_image)
+                        if res.face_landmarks:
+                            for face_landmarks in res.face_landmarks:
+                                ih, iw = frame.shape[:2]
+                                x_coords = [lm.x * iw for lm in face_landmarks]
+                                y_coords = [lm.y * ih for lm in face_landmarks]
+                                x, y = int(min(x_coords)), int(min(y_coords))
+                                fw, fh = int(max(x_coords)) - x, int(max(y_coords)) - y
+                                pad = int(fw * 0.15)
+                                x, y, fw, fh = max(0, x-pad), max(0, y-pad), fw+2*pad, fh+2*pad
+                                cx, cy = x + fw//2, y + fh//2
+                                if roi_x1 < cx < roi_x2 and roi_y1 < cy < roi_y2:
+                                    roi_faces.append((x, y, fw, fh, face_landmarks))
+                                else: cv2.rectangle(frame, (x, y), (x+fw, y+fh), (100, 100, 100), 1)
+                    else:
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        faces = face_cascade.detectMultiScale(gray, 1.1, 6)
+                        for (x, y, fw, fh) in faces:
+                            cx, cy = x + fw//2, y + fh//2
+                            if roi_x1 < cx < roi_x2 and roi_y1 < cy < roi_y2:
+                                roi_faces.append((x, y, fw, fh, None))
+                            else: cv2.rectangle(frame, (x, y), (x+fw, y+fh), (100, 100, 100), 1)
+
+                    now = time.time()
+                    target_face = None
+                    if state.locked_face:
+                        lx, ly, _, _ = state.locked_face['box']
+                        best_match = None; min_dist = 120
+                        for f in roi_faces:
+                            dist = abs(f[0] - lx) + abs(f[1] - ly)
+                            if dist < min_dist: min_dist = dist; best_match = f
+                        if best_match:
+                            state.locked_face['box'] = best_match[:4]; target_face = best_match
+                        else: state.locked_face = None
+                    elif roi_faces:
+                        target_face = roi_faces[0]
+                        state.locked_face = {'box': target_face[:4], 'start_time': now}
+                        state.analysis_buffer = []; state.analysis_complete = False
+                        with state.lock: state.visitors += 1
+
+                    if target_face:
+                        x, y, fw, fh, lms = target_face
+                        if lms and MEDIAPIPE_ENABLED:
+                            # Draw Dots manually (Neural Mesh effect)
+                            for lm in lms:
+                                px, py = int(lm.x * w), int(lm.y * h)
+                                cv2.circle(frame, (px, py), 1, (0, 255, 0), -1)
+                        else: cv2.rectangle(frame, (x, y), (x+fw, y+fh), (0, 215, 255), 2)
+
+                        face_roi = frame[max(0,y):min(h,y+fh), max(0,x):min(w,x+fw)]
+                        if face_roi.size > 0:
+                            f_gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+                            f_gray = cv2.equalizeHist(f_gray)
+                            f_inp = np.reshape(cv2.resize(f_gray, (48, 48))/255.0, (1, 48, 48, 1))
+                            elapsed = now - state.locked_face['start_time']
+                            
+                            if not state.analysis_complete:
+                                if emotion_model:
+                                    pred = emotion_model.predict(f_inp, verbose=0)
+                                    state.analysis_buffer.append(emotion_labels[np.argmax(pred)])
+                                progress = min(int((elapsed / 3.0) * 100), 100)
+                                with state.lock:
+                                    state.emotion = "Analyzing..."
+                                    state.message = f"{'Neural Scan' if MEDIAPIPE_ENABLED else 'Scanning'}: {progress}%"
+                                    state.age = "..."; state.gender = "..."
+                                if elapsed > 3.0:
+                                    from collections import Counter
+                                    final_emo = Counter(state.analysis_buffer).most_common(1)[0][0] if state.analysis_buffer else "Neutral"
+                                    age, gen = detect_age_gender(face_roi)
+                                    state.final_result = {"emotion": final_emo, "age": age, "gender": gen,
+                                        "heatmap": EMOTION_HEATMAP.get(final_emo, 'amber'),
+                                        "message": EMOTION_MESSAGES.get(final_emo, "Done")}
+                                    state.analysis_complete = True
+                                    with state.lock: state.emotion_stats[final_emo] += 1
+                        
+                        if state.analysis_complete:
+                            res = state.final_result
+                            with state.lock:
+                                state.emotion, state.heatmap, state.message, state.age, state.gender = \
+                                    res["emotion"], res["heatmap"], res["message"], res["age"], res["gender"]
+                            color = (0, 255, 0)
+                            cv2.rectangle(frame, (x, y), (x+fw, y+fh), color, 3)
+                            cv2.putText(frame, res["emotion"], (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    else:
+                        with state.lock:
+                            state.emotion = "Neutral"; state.heatmap = "amber"; state.message = "Please step into the Zone"
             
-            # Draw emotion message below face
-            message = EMOTION_MESSAGES[emotion]
-            cv2.putText(frame, message, (x, y + h + 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
-        
-        # ----------------------------------------------------------------
-        # UPDATE DOMINANT EMOTION (for border color)
-        # ----------------------------------------------------------------
-        if current_emotions:
-            # Most common emotion in current frame
-            dominant_emotion = max(set(current_emotions), key=current_emotions.count)
-        
-        # ----------------------------------------------------------------
-        # DRAW EMOTION HEATMAP BORDER
-        # ----------------------------------------------------------------
-        border_color = EMOTION_COLORS.get(dominant_emotion, (0, 255, 255))
-        border_thickness = 15
-        h_frame, w_frame = frame.shape[:2]
-        
-        # Draw colored border
-        cv2.rectangle(frame, (0, 0), (w_frame, h_frame), border_color, border_thickness)
-        
-        # ----------------------------------------------------------------
-        # DISPLAY VISITOR COUNT
-        # ----------------------------------------------------------------
-        cv2.putText(frame, f"Visitors: {visitor_count}", (20, 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        cv2.putText(frame, f"Visitors: {visitor_count}", (20, 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
-        
-        # ----------------------------------------------------------------
-        # UPDATE STATISTICS CHART (periodically for performance)
-        # ----------------------------------------------------------------
-        if frame_count % chart_update_interval == 0 or stats_chart is None:
-            stats_chart = create_stats_chart(emotion_stats)
-        
-        # Resize chart to fit in corner
-        chart_height = 300
-        chart_width = 450
-        stats_chart_resized = cv2.resize(stats_chart, (chart_width, chart_height))
-        
-        # Overlay chart on frame (top-right corner)
-        x_offset = w_frame - chart_width - 20
-        y_offset = 20
-        
-        # Create semi-transparent overlay
-        overlay = frame.copy()
-        overlay[y_offset:y_offset+chart_height, x_offset:x_offset+chart_width] = stats_chart_resized
-        frame = cv2.addWeighted(overlay, 0.85, frame, 0.15, 0)
-        
-        # ----------------------------------------------------------------
-        # DISPLAY FRAME
-        # ----------------------------------------------------------------
-        cv2.imshow("🎭 Enhanced Emotion Detection System", frame)
-        
-        # Exit on ESC key
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-    
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
-    
-    print("\n" + "="*60)
-    print("📊 SESSION SUMMARY")
-    print("="*60)
-    print(f"Total Visitors: {visitor_count}")
-    print("\nEmotion Statistics:")
-    for emotion, count in sorted(emotion_stats.items(), key=lambda x: x[1], reverse=True):
-        print(f"  {emotion}: {count}")
-    print("="*60)
+            state.frame_count += 1
+            _, buf = cv2.imencode('.jpg', frame)
+            with state.lock: state.current_frame = buf.tobytes()
 
 # ============================================================================
-# ENTRY POINT
+# SECTION 4: API ENDPOINTS
 # ============================================================================
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+def home():
+    return {"message": "API running successfully", "status": "online"}
+
+@app.post("/reset_camera")
+async def reset_camera():
+    """Forces the camera worker to release current camera and re-scan"""
+    print("[CMD] Received Camera Reset Command")
+    # Quickest way: trigger a "connection lost" state logic if we could, 
+    # but since camera_worker is a loop, we can just close the cap if it exists?
+    # Actually, we can't easily reach into the thread variables.
+    # ALTERNATIVE: Set a flag or better, just rely on our hot-plug logic which is now robust.
+    # BUT, the user wants a manual button.
+    # Let's add a `force_reset` flag to state?
+    with state.lock:
+        state.system_status["camera"] = "Resetting..."
+    # We can't directly kill the cap from here without complex thread sharing.
+    # Instead, we will kill the process and let the worker restart? No.
+    # Simple hack: The worker is robust. We can add a 'reset_requested' flag to DetectionState.
+    state.reset_requested = True
+    return {"status": "Camera reset requested"}
+
+
+
+
+@app.post("/control")
+async def control(request: Request):
+    data = await request.json()
+    cmd = data.get("command")
+    with state.lock:
+        if cmd == "start": state.is_running = True
+        elif cmd == "stop": state.is_running = False
+    return {"status": "ok", "is_running": state.is_running}
+
+@app.get("/status")
+def get_status():
+    with state.lock:
+        return {
+            "is_running": state.is_running,
+            "camera_url": state.camera_url,
+            "emotion": state.emotion,
+            "age": state.age,
+            "gender": state.gender,
+            "visitors": state.visitors,
+            "message": state.message,
+            "heatmap": state.heatmap,
+            "emotion_stats": state.emotion_stats,
+            "system_status": state.system_status
+        }
+
+@app.get("/video_feed")
+def video_feed():
+    def gen():
+        while True:
+            frame = None
+            with state.lock: frame = state.current_frame
+            if frame:
+                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            time.sleep(0.05)
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 if __name__ == "__main__":
-    main()
+    # Start Camera Thread only once
+    t = threading.Thread(target=camera_worker, daemon=True)
+    t.start()
+    print("[INFO] Camera Thread Started")
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

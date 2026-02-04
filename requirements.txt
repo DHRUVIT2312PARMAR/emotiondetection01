@@ -5,3 +5,7 @@ tf-keras
 fastapi
 uvicorn
 scipy
+mediapipe
+python-multipart
+gunicorn
+matplotlib
