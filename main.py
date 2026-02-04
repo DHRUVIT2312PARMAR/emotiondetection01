@@ -355,6 +355,7 @@ def camera_worker():
 # SECTION 4: API ENDPOINTS
 # ============================================================================
 
+# FastAPI Application Configuration for Render
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
