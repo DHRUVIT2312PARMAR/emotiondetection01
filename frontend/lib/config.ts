@@ -1,6 +1,6 @@
 // This environment variable should be set in the Vercel Dashboard
 // Example: NEXT_PUBLIC_API_URL = https://your-backend-name.onrender.com
-const FALLBACK_URL = "https://your-backend-name.onrender.com"; // Replace this with your actual Render URL
+const FALLBACK_URL = "https://emotiondetection01.onrender.com"; // Your live Render URL
 
 const getBaseUrl = () => {
     // Priority 1: Environment Variable (Vercel/Production)
