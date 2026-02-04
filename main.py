@@ -384,6 +384,18 @@ async def reset_camera():
 
 
 
+@app.get("/start")
+def start_system():
+    with state.lock:
+        state.is_running = True
+    return {"status": "started", "is_running": True}
+
+@app.get("/stop")
+def stop_system():
+    with state.lock:
+        state.is_running = False
+    return {"status": "stopped", "is_running": False}
+
 @app.post("/control")
 async def control(request: Request):
     data = await request.json()
